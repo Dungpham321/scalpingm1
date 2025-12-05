@@ -1,216 +1,192 @@
-# xauusd_bot_fixed_v5.py
-"""
-XAUUSD Hybrid Bot (Range + Trend) — Safe ATR Version
-- MT5 login + Telegram enabled
-- Lot cố định 0.01, SL/TP tự tính an toàn
-"""
-import time
-from datetime import datetime
-import pandas as pd
+# -*- coding: utf-8 -*-
 import MetaTrader5 as mt5
+import pandas as pd
+import time
+import math
 
-# ---------------- CONFIG ----------------
-SYMBOL = "XAUUSD"
-TIMEFRAME_M5 = mt5.TIMEFRAME_M5
-TIMEFRAME_M15 = mt5.TIMEFRAME_M15
-
-# MT5 login
-MT5_LOGIN = 272913829
+# ==================== CẤU HÌNH ====================
+MT5_LOGIN = 270522374
 MT5_PASSWORD = "Dung2082000!"
-MT5_SERVER = "Exness-MT5Trial14"
+MT5_SERVER = "Exness-MT5Trial17"
+SYMBOL = "XAUUSD"
 
-# Telegram
-TELEGRAM_TOKEN = "8396443766:AAH_8z_h9rh4Hdc8QNaUR-l1mGtSAYrVDT0"
-TELEGRAM_CHAT_ID = "5464701753"
-USE_TELEGRAM = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+TIMEFRAME = mt5.TIMEFRAME_M1
+RISK_PERCENT = 1.0
+MIN_LOT = 0.01
+MAX_LOT = 0.05
+SLEEP_INTERVAL = 0.5
+MAX_ORDERS = 3
+TRAIL_STEP = 0.2
+MOMENTUM_N = 3       # số nến dùng để tính momentum
+MOMENTUM_THRESHOLD = 0.1  # threshold lọc nhiễu nhỏ
 
-# Lot / Risk
-BASE_LOT = 0.01
-MAX_POSITIONS = 3
-DEVIATION = 150
-MAGIC = 234000
-
-# Strategy toggles
-USE_RANGE = True
-USE_TREND = True
-
-# TP/SL & Position Management
-BE_MOVE = 6   # break-even pips
-LOOP_DELAY = 1
-
-# ---------------- UTIL ----------------
-def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-def log(msg): print(f"[{now_str()}] {msg}")
-
-def send_telegram(msg):
-    if not USE_TELEGRAM: return
-    try:
-        import requests
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-    except Exception as e:
-        log(f"[TG] send error: {e}")
-
-def connect_mt5():
-    if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
-        raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
-    mt5.symbol_select(SYMBOL, True)
-    log("MT5 initialized")
-
-def shutdown_mt5():
+# ==================== KẾT NỐI MT5 ====================
+if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
+    print("Không kết nối MT5 được")
     mt5.shutdown()
-    log("MT5 shutdown")
+    exit()
+print("MT5 kết nối thành công!")
 
-def get_digits_pip(symbol):
-    info = mt5.symbol_info(symbol)
-    digits = info.digits
-    pip = 0.001 if digits >= 3 else 0.01
-    return digits, pip
-
-def get_ohlcv(symbol, timeframe, n=500):
+# ==================== HÀM HỖ TRỢ ====================
+def get_data(symbol, timeframe, n=100):
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
     df = pd.DataFrame(rates)
     df['time'] = pd.to_datetime(df['time'], unit='s')
-    df.set_index('time', inplace=True)
     return df
 
-def ema(series, period): return series.ewm(span=period, adjust=False).mean()
-def atr(df, period=14):
-    h,l,c = df['high'], df['low'], df['close']
-    prev = c.shift(1)
-    tr = pd.concat([h-l, (h-prev).abs(), (l-prev).abs()], axis=1).max(axis=1)
-    return tr.rolling(period, min_periods=1).mean()
+def calculate_atr(df, period=14):
+    df['h-l'] = df['high'] - df['low']
+    df['h-pc'] = abs(df['high'] - df['close'].shift())
+    df['l-pc'] = abs(df['low'] - df['close'].shift())
+    tr = df[['h-l','h-pc','l-pc']].max(axis=1)
+    atr = tr.rolling(period).mean().iloc[-1]
+    return atr
 
-def is_bullish_engulfing(df):
-    if len(df)<2: return False
-    o1,c1,o2,c2 = df['open'].iloc[-2], df['close'].iloc[-2], df['open'].iloc[-1], df['close'].iloc[-1]
-    return (c1<o1) and (c2>o2) and (c2>o1) and (o2<c1)
+def calc_lot(balance, atr):
+    # lot tự động theo balance và ATR
+    risk_per_lot = 10 * atr  # ước lượng rủi ro 1 lot
+    lot = balance * RISK_PERCENT / 100 / risk_per_lot
+    lot = max(lot, MIN_LOT)
+    lot = min(lot, MAX_LOT)
+    step = mt5.symbol_info(SYMBOL).volume_step
+    lot = math.floor(lot / step) * step
+    return round(lot, 2)
 
-def is_bearish_engulfing(df):
-    if len(df)<2: return False
-    o1,c1,o2,c2 = df['open'].iloc[-2], df['close'].iloc[-2], df['open'].iloc[-1], df['close'].iloc[-1]
-    return (c1>o1) and (c2<o2) and (c2<o1) and (o2>c1)
-
-def pinbar_type(df, tail_ratio=2.0):
-    o,c,h,l = df['open'].iloc[-1], df['close'].iloc[-1], df['high'].iloc[-1], df['low'].iloc[-1]
-    body = abs(c-o) or 1e-9
-    upper, lower = h-max(c,o), min(c,o)-l
-    if lower>tail_ratio*body and upper<body: return 'BULL'
-    if upper>tail_ratio*body and lower<body: return 'BEAR'
-    return None
-
-# ---------------- SIGNAL ----------------
-def range_signal(df5, pip):
-    if len(df5)<50: return None
-    atr_val = atr(df5).iloc[-1]
-    close = df5['close'].iloc[-1]
-    if atr_val/close>0.0015: return None
-    r_low,r_high = df5['low'].tail(20).min(), df5['high'].tail(20).max()
-    buf = 0.6*pip
-    if close<=r_low+buf: return 'BUY'
-    if close>=r_high-buf: return 'SELL'
-    return None
-
-def trend_signal(df15, df5, pip):
-    ema50 = ema(df15['close'],50)
-    slope = ema50.iloc[-1]-ema50.iloc[-4]
-    trend='NEUTRAL'
-    if slope>0.8*pip: trend='UP'
-    elif slope<-0.8*pip: trend='DOWN'
-    df5c = df5.copy()
-    pb_touch = abs(df5c['close'].iloc[-1]-ema(df5c['close'],21).iloc[-1])<0.006*df5c['close'].iloc[-1]
-    bull = is_bullish_engulfing(df5c)
-    bear = is_bearish_engulfing(df5c)
-    pin = pinbar_type(df5c)
-    buy=sell=False
-    if trend=='UP' and pb_touch and (bull or pin=='BULL'): buy=True
-    if trend=='DOWN' and pb_touch and (bear or pin=='BEAR'): sell=True
-    if buy and not sell: return 'BUY'
-    if sell and not buy: return 'SELL'
-    return None
-
-# ---------------- ORDER UTIL ----------------
-def calculate_sl_tp(symbol, side, entry_price, atr_val, lot=0.01, sl_dollar=3, tp_dollar=5):
-    info = mt5.symbol_info(symbol)
+def calc_sl_tp(price, order_type):
+    info = mt5.symbol_info(SYMBOL)
     digits = info.digits
     point = info.point
-    stop_level = getattr(info, 'trade_stops_level', 15)  # broker stop level in points
-    min_dist = stop_level * point * 1.2  # cách entry tối thiểu
+    min_stop = info.trade_stops_level * point + 0.01
 
-    # Chuyển $ sang khoảng giá thực tế
-    # 1 lot XAUUSD = 100 oz, pip_value ~ $1/pip với 0.01 lot
-    pip_size = 0.001 if digits >= 3 else 0.01
-    sl_dist_price = max(min(atr_val*1.5, sl_dollar / (lot * 10)), min_dist)
-    tp_dist_price = max(min(atr_val*2.0, tp_dollar / (lot * 10)), min_dist)
+    # SL/TP tối thiểu hợp lệ broker
+    sl_distance = max(0.5, min_stop)  # ~50 pip thực tế
+    tp_distance = max(0.5, min_stop)
 
-    if side=="BUY":
-        sl = entry_price - sl_dist_price
-        tp = entry_price + tp_dist_price
+    if order_type == mt5.ORDER_TYPE_BUY:
+        sl = round(price - sl_distance, digits)
+        tp = round(price + tp_distance, digits)
     else:
-        sl = entry_price + sl_dist_price
-        tp = entry_price - tp_dist_price
+        sl = round(price + sl_distance, digits)
+        tp = round(price - tp_distance, digits)
 
-    return round(sl, digits), round(tp, digits)
+    return sl, tp
 
 
-def safe_place_order(symbol, side, lot, atr_val):
-    tick = mt5.symbol_info_tick(symbol)
-    price = tick.ask if side=="BUY" else tick.bid
-    sl, tp = calculate_sl_tp(symbol, side, price, atr_val)
-    ord_type = mt5.ORDER_TYPE_BUY if side=="BUY" else mt5.ORDER_TYPE_SELL
-    req = {"action":mt5.TRADE_ACTION_DEAL,"symbol":symbol,"volume":lot,
-           "type":ord_type,"price":price,"sl":sl,"tp":tp,
-           "deviation":DEVIATION,"magic":MAGIC,"comment":"XAU_fixed_v5"}
-    res = mt5.order_send(req)
-    log(f"[ORDER] {side} price={price} tp={tp} sl={sl} lot={lot} res={getattr(res,'retcode',str(res))}")
-    send_telegram(f"{side} → Price:{price} TP:{tp} SL:{sl} Lot:{lot}")
-    return res
+def open_order(symbol, order_type, lot, retries=3):
+    for attempt in range(retries):
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None
+        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+        sl, tp = calc_sl_tp(price, order_type)
+        print(sl, tp)
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": order_type,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": 20,
+            "magic": 123456,
+            "comment": "scalping_M1_v9.2",
+            "type_filling": mt5.ORDER_FILLING_FOK,
+        }
+        result = mt5.order_send(request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            return result
+        elif result.retcode in [10019, 10016]:
+            print(f"Lỗi: {result.retcode}")
+            time.sleep(0.05)
+            continue
+        elif result.retcode == 10026:
+            print("SL/TP quá gần, bỏ qua lệnh")
+            return None
+        else:
+            print(f"Lỗi mở lệnh: {result.retcode}")
+            return None
+    return None
 
-# ---------------- POSITION MANAGEMENT ----------------
-def manage_positions(symbol, pip):
+def count_positions(symbol):
+    buy_count = sell_count = 0
     positions = mt5.positions_get(symbol=symbol)
-    if not positions: return
-    tick = mt5.symbol_info_tick(symbol)
-    for p in positions:
-        try:
-            if p.type==mt5.ORDER_TYPE_BUY:
-                profit_pips=(tick.bid - p.price_open)/pip
-                if profit_pips>=BE_MOVE and p.sl<p.price_open:
-                    mt5.order_send({"action":mt5.TRADE_ACTION_SLTP,"position":p.ticket,"sl":p.price_open})
+    if positions:
+        for pos in positions:
+            if pos.type == mt5.ORDER_TYPE_BUY:
+                buy_count += 1
             else:
-                profit_pips=(p.price_open - tick.ask)/pip
-                if profit_pips>=BE_MOVE and (p.sl==0 or p.sl>p.price_open):
-                    mt5.order_send({"action":mt5.TRADE_ACTION_SLTP,"position":p.ticket,"sl":p.price_open})
-        except: pass
+                sell_count += 1
+    return buy_count, sell_count
 
-# ---------------- MAIN ----------------
-def main():
-    connect_mt5()
-    digits, pip = get_digits_pip(SYMBOL)
-    log(f"Bot started for {SYMBOL} digits={digits} pip={pip}")
-    try:
-        while True:
-            positions = mt5.positions_get(symbol=SYMBOL) or []
-            if len(positions)<MAX_POSITIONS:
-                df5 = get_ohlcv(SYMBOL, TIMEFRAME_M5, 300)
-                df15 = get_ohlcv(SYMBOL, TIMEFRAME_M15, 400)
-                atr_val = atr(df5, 14).iloc[-1]
-                side = None
-                if USE_RANGE:
-                    side = range_signal(df5, pip)
-                    if side:
-                        safe_place_order(SYMBOL, side, BASE_LOT, atr_val)
-                if USE_TREND and not side:
-                    side = trend_signal(df15, df5, pip)
-                    side = "SELL"
-                    if side:
-                        safe_place_order(SYMBOL, side, BASE_LOT, atr_val)
-            manage_positions(SYMBOL, pip)
-            time.sleep(LOOP_DELAY)
-    except KeyboardInterrupt:
-        log("Stopped by user")
-    finally:
-        shutdown_mt5()
+def update_trailing_stop(symbol, atr, trail_step=TRAIL_STEP):
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        return
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return
+    digits = mt5.symbol_info(SYMBOL).digits
+    min_gap = 0.5 * atr
 
-if __name__=="__main__":
-    main()
+    for pos in positions:
+        if pos.type == mt5.ORDER_TYPE_BUY:
+            target_sl = tick.ask - atr * trail_step
+            new_sl = max(pos.sl if pos.sl else pos.price_open, target_sl)
+            if new_sl < tick.ask - min_gap:
+                new_sl = tick.ask - min_gap
+            new_sl = round(new_sl, digits)
+            if new_sl > (pos.sl if pos.sl else 0):
+                request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": pos.ticket,
+                    "symbol": symbol,
+                    "sl": new_sl,
+                    "tp": pos.tp
+                }
+                mt5.order_send(request)
+        else:
+            target_sl = tick.bid + atr * trail_step
+            new_sl = min(pos.sl if pos.sl else pos.price_open, target_sl)
+            if new_sl > tick.bid + min_gap:
+                new_sl = tick.bid + min_gap
+            new_sl = round(new_sl, digits)
+            if pos.sl is None or new_sl < pos.sl:
+                request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": pos.ticket,
+                    "symbol": symbol,
+                    "sl": new_sl,
+                    "tp": pos.tp
+                }
+                mt5.order_send(request)
+
+# ==================== BOT CHÍNH ====================
+try:
+    while True:
+        df = get_data(SYMBOL, TIMEFRAME, 100)
+        atr = calculate_atr(df)
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if tick is None:
+            time.sleep(SLEEP_INTERVAL)
+            continue
+
+        balance = mt5.account_info().balance
+        lot = calc_lot(balance, atr)
+        buy_count, sell_count = count_positions(SYMBOL)
+
+        # Momentum nhiều nến
+        momentum = df['close'].iloc[-1] - df['close'].iloc[-1-MOMENTUM_N]
+        print(momentum)
+        if momentum > MOMENTUM_THRESHOLD and buy_count < MAX_ORDERS:
+            open_order(SYMBOL, mt5.ORDER_TYPE_BUY, lot)
+        elif momentum < -MOMENTUM_THRESHOLD and sell_count < MAX_ORDERS:
+            open_order(SYMBOL, mt5.ORDER_TYPE_SELL, lot)
+
+        update_trailing_stop(SYMBOL, atr)
+        time.sleep(SLEEP_INTERVAL)
+
+except KeyboardInterrupt:
+    print("Dừng bot bằng tay")
+finally:
+    mt5.shutdown()
