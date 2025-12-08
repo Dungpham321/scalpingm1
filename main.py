@@ -1,192 +1,167 @@
 # -*- coding: utf-8 -*-
+"""
+Scalping M1 — Continuous Entry Bot (Safe Version)
+Tập trung vào:
+ - Vào lệnh LIÊN TỤC (momentum tick + micro structure)
+ - Kiểm soát rủi ro chặt chẽ
+ - Không SL/TP cứng khi mở lệnh (tránh 10026)
+ - Auto-SL sau khi spread ổn định
+ - Trailing-stop chủ động
+"""
+
 import MetaTrader5 as mt5
 import pandas as pd
+import numpy as np
 import time
 import math
 
-# ==================== CẤU HÌNH ====================
-MT5_LOGIN = 270522374
-MT5_PASSWORD = "Dung2082000!"
-MT5_SERVER = "Exness-MT5Trial17"
+# ================= CONFIG =================
+LOGIN = 270522374
+PASSWORD = "Dung2082000!"
+SERVER = "Exness-MT5Trial17"
 SYMBOL = "XAUUSD"
-
 TIMEFRAME = mt5.TIMEFRAME_M1
-RISK_PERCENT = 1.0
+
+MAX_ORDERS = 5
+RISK_PERCENT = 0.5
 MIN_LOT = 0.01
-MAX_LOT = 0.05
-SLEEP_INTERVAL = 0.5
-MAX_ORDERS = 3
-TRAIL_STEP = 0.2
-MOMENTUM_N = 3       # số nến dùng để tính momentum
-MOMENTUM_THRESHOLD = 0.1  # threshold lọc nhiễu nhỏ
+MAX_LOT = 0.1
 
-# ==================== KẾT NỐI MT5 ====================
-if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
-    print("Không kết nối MT5 được")
-    mt5.shutdown()
-    exit()
-print("MT5 kết nối thành công!")
+SLEEP = 0.20
+TRAIL_ATR_MULT = 0.5
+SAFE_SPREAD = 115   # giới hạn spread tối đa
 
-# ==================== HÀM HỖ TRỢ ====================
-def get_data(symbol, timeframe, n=100):
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
+# ================ INIT =====================
+mt5.initialize(login=LOGIN, password=PASSWORD, server=SERVER)
+
+# ================ FUNCTIONS ================
+def get_df(n=200):
+    rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, n)
     df = pd.DataFrame(rates)
     df['time'] = pd.to_datetime(df['time'], unit='s')
     return df
 
-def calculate_atr(df, period=14):
-    df['h-l'] = df['high'] - df['low']
-    df['h-pc'] = abs(df['high'] - df['close'].shift())
-    df['l-pc'] = abs(df['low'] - df['close'].shift())
-    tr = df[['h-l','h-pc','l-pc']].max(axis=1)
-    atr = tr.rolling(period).mean().iloc[-1]
-    return atr
+
+def calc_atr(df, n=14):
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(n).mean().iloc[-1]
+
+
+def spread_ok():
+    tick = mt5.symbol_info_tick(SYMBOL)
+    return (tick.ask - tick.bid) / mt5.symbol_info(SYMBOL).point <= SAFE_SPREAD
+
 
 def calc_lot(balance, atr):
-    # lot tự động theo balance và ATR
-    risk_per_lot = 10 * atr  # ước lượng rủi ro 1 lot
-    lot = balance * RISK_PERCENT / 100 / risk_per_lot
-    lot = max(lot, MIN_LOT)
-    lot = min(lot, MAX_LOT)
+    risk_money = balance * (RISK_PERCENT / 100)
+    est_sl = atr * 10
+    raw = risk_money / est_sl
+    raw = max(MIN_LOT, min(raw, MAX_LOT))
     step = mt5.symbol_info(SYMBOL).volume_step
-    lot = math.floor(lot / step) * step
-    return round(lot, 2)
-
-def calc_sl_tp(price, order_type):
-    info = mt5.symbol_info(SYMBOL)
-    digits = info.digits
-    point = info.point
-    min_stop = info.trade_stops_level * point + 0.01
-
-    # SL/TP tối thiểu hợp lệ broker
-    sl_distance = max(0.5, min_stop)  # ~50 pip thực tế
-    tp_distance = max(0.5, min_stop)
-
-    if order_type == mt5.ORDER_TYPE_BUY:
-        sl = round(price - sl_distance, digits)
-        tp = round(price + tp_distance, digits)
-    else:
-        sl = round(price + sl_distance, digits)
-        tp = round(price - tp_distance, digits)
-
-    return sl, tp
+    return round(raw / step) * step
 
 
-def open_order(symbol, order_type, lot, retries=3):
-    for attempt in range(retries):
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
-            return None
-        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
-        sl, tp = calc_sl_tp(price, order_type)
-        print(sl, tp)
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": lot,
-            "type": order_type,
-            "price": price,
-            "sl": sl,
-            "tp": tp,
-            "deviation": 20,
-            "magic": 123456,
-            "comment": "scalping_M1_v9.2",
-            "type_filling": mt5.ORDER_FILLING_FOK,
-        }
-        result = mt5.order_send(request)
-        if result.retcode == mt5.TRADE_RETCODE_DONE:
-            return result
-        elif result.retcode in [10019, 10016]:
-            print(f"Lỗi: {result.retcode}")
-            time.sleep(0.05)
-            continue
-        elif result.retcode == 10026:
-            print("SL/TP quá gần, bỏ qua lệnh")
-            return None
-        else:
-            print(f"Lỗi mở lệnh: {result.retcode}")
-            return None
-    return None
+def entry_signal(df, atr):
+    # Momentum 2 nến
+    mom = df['close'].iloc[-1] - df['close'].iloc[-3]
 
-def count_positions(symbol):
-    buy_count = sell_count = 0
-    positions = mt5.positions_get(symbol=symbol)
-    if positions:
-        for pos in positions:
-            if pos.type == mt5.ORDER_TYPE_BUY:
-                buy_count += 1
-            else:
-                sell_count += 1
-    return buy_count, sell_count
+    # Micro-structure: break minor high/low
+    bh = df['high'].rolling(5).max().iloc[-2]
+    bl = df['low'].rolling(5).min().iloc[-2]
 
-def update_trailing_stop(symbol, atr, trail_step=TRAIL_STEP):
-    positions = mt5.positions_get(symbol=symbol)
+    last = df['close'].iloc[-1]
+
+    # Tick Volume Spike
+    vol = df['tick_volume']
+    vol_burst = vol.iloc[-1] > vol.rolling(20).mean().iloc[-1] * 1.5
+
+    buy  = last > bh and mom > 0 and vol_burst
+    sell = last < bl and mom < 0 and vol_burst
+
+    return buy, sell
+
+
+def open_order(order_type, lot):
+    tick = mt5.symbol_info_tick(SYMBOL)
+    price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SYMBOL,
+        "volume": lot,
+        "type": order_type,
+        "price": price,
+        "deviation": 20,
+        "magic": 444001,
+        "comment": "scalp_m1_safe",
+        "type_filling": mt5.ORDER_FILLING_FOK,
+    }
+
+    result = mt5.order_send(request)
+    return result
+
+
+def set_sltp(position_ticket, sl, tp):
+    req = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "position": position_ticket,
+        "sl": sl,
+        "tp": tp
+    }
+    mt5.order_send(req)
+
+
+def trailing(atr):
+    tick = mt5.symbol_info_tick(SYMBOL)
+    positions = mt5.positions_get(symbol=SYMBOL)
     if not positions:
         return
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        return
+
     digits = mt5.symbol_info(SYMBOL).digits
-    min_gap = 0.5 * atr
 
-    for pos in positions:
-        if pos.type == mt5.ORDER_TYPE_BUY:
-            target_sl = tick.ask - atr * trail_step
-            new_sl = max(pos.sl if pos.sl else pos.price_open, target_sl)
-            if new_sl < tick.ask - min_gap:
-                new_sl = tick.ask - min_gap
-            new_sl = round(new_sl, digits)
-            if new_sl > (pos.sl if pos.sl else 0):
-                request = {
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "position": pos.ticket,
-                    "symbol": symbol,
-                    "sl": new_sl,
-                    "tp": pos.tp
-                }
-                mt5.order_send(request)
+    for p in positions:
+        if p.type == 0:  # BUY
+            new_sl = tick.bid - atr * TRAIL_ATR_MULT
+            if p.sl is None or new_sl > p.sl:
+                set_sltp(p.ticket, round(new_sl, digits), p.tp)
         else:
-            target_sl = tick.bid + atr * trail_step
-            new_sl = min(pos.sl if pos.sl else pos.price_open, target_sl)
-            if new_sl > tick.bid + min_gap:
-                new_sl = tick.bid + min_gap
-            new_sl = round(new_sl, digits)
-            if pos.sl is None or new_sl < pos.sl:
-                request = {
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "position": pos.ticket,
-                    "symbol": symbol,
-                    "sl": new_sl,
-                    "tp": pos.tp
-                }
-                mt5.order_send(request)
+            new_sl = tick.ask + atr * TRAIL_ATR_MULT
+            if p.sl is None or new_sl < p.sl:
+                set_sltp(p.ticket, round(new_sl, digits), p.tp)
 
-# ==================== BOT CHÍNH ====================
-try:
-    while True:
-        df = get_data(SYMBOL, TIMEFRAME, 100)
-        atr = calculate_atr(df)
-        tick = mt5.symbol_info_tick(SYMBOL)
-        if tick is None:
-            time.sleep(SLEEP_INTERVAL)
-            continue
 
-        balance = mt5.account_info().balance
-        lot = calc_lot(balance, atr)
-        buy_count, sell_count = count_positions(SYMBOL)
+# =============== MAIN LOOP ==================
+while True:
+    df = get_df()
+    atr = calc_atr(df)
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if not spread_ok():
+        time.sleep(SLEEP)
+        continue
 
-        # Momentum nhiều nến
-        momentum = df['close'].iloc[-1] - df['close'].iloc[-1-MOMENTUM_N]
-        print(momentum)
-        if momentum > MOMENTUM_THRESHOLD and buy_count < MAX_ORDERS:
-            open_order(SYMBOL, mt5.ORDER_TYPE_BUY, lot)
-        elif momentum < -MOMENTUM_THRESHOLD and sell_count < MAX_ORDERS:
-            open_order(SYMBOL, mt5.ORDER_TYPE_SELL, lot)
+    balance = mt5.account_info().balance
+    lot = calc_lot(balance, atr)
 
-        update_trailing_stop(SYMBOL, atr)
-        time.sleep(SLEEP_INTERVAL)
+    buy_sig, sell_sig = entry_signal(df, atr)
 
-except KeyboardInterrupt:
-    print("Dừng bot bằng tay")
-finally:
-    mt5.shutdown()
+    positions = mt5.positions_get(symbol=SYMBOL)
+    count = len(positions) if positions else 0
+    print(f"Buy: {buy_sig} | Sell: {sell_sig}")
+    if buy_sig and count < MAX_ORDERS:
+        r = open_order(mt5.ORDER_TYPE_BUY, lot)
+
+    if sell_sig and count < MAX_ORDERS:
+        r = open_order(mt5.ORDER_TYPE_SELL, lot)
+
+    trailing(atr)
+    time.sleep(SLEEP)
+
+
+# END BOT
